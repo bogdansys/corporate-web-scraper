@@ -85,6 +85,45 @@ curl -X POST http://localhost:3000/api/match \
 | `npm run test:match-rate` | Match rate test |
 | `npm run analyze` | Crawl analysis report |
 
+## CLI Usage (Full Workflow)
+
+```bash
+# 1. Install dependencies
+npm install
+
+# 2. Start ElasticSearch
+docker compose up -d
+
+# 3. Scrape all 997 websites
+#    Tier 1 only (HTTP + regex, fastest — well under 10 min):
+npx tsx src/scraper/index.ts
+
+#    Tier 1 + 2 (adds Playwright for JS-rendered sites):
+npx tsx src/scraper/index.ts --tier2
+
+#    All 3 tiers (adds Gemini AI refinement for low-quality results, ~15 min):
+npx tsx src/scraper/index.ts --tier2 --tier3
+
+# 4. Run the ETL pipeline (merge with company names → normalize → seed Supabase → index ElasticSearch)
+npm run pipeline
+
+# 5. Start the API server
+npm run api                    # http://localhost:3000
+                               # Swagger docs: http://localhost:3000/docs
+
+# 6. Test match rate against the 32 API input samples
+npm run test:match-rate
+
+# 7. Generate crawl analysis report (coverage, fill rates)
+npm run analyze
+
+# 8. Run unit tests
+npm test
+
+# 9. Start the dashboard (optional)
+cd dashboard && npm install && npm run dev   # http://localhost:5173
+```
+
 ## Tech Stack
 
 TypeScript, Node.js 20, Express 5, ElasticSearch 8.12, Supabase/PostgreSQL, Playwright, Google Gemini AI, React 19, Vite 7, Tailwind CSS v4, Recharts, Vitest, Docker

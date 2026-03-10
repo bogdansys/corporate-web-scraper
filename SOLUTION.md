@@ -56,7 +56,7 @@ This separation means the dashboard never depends on the Express server for data
 Each domain is processed through three tiers with automatic fallback based on quality scoring:
 
 **Tier 1 — HTTP + Regex** (all domains)
-- Plain HTTP requests with `VeridionChallengeCrawler/1.0` User-Agent
+- Plain HTTP requests with a standard Chrome User-Agent
 - Multi-page: homepage + contact page + about page (if allowed by robots.txt)
 - Regex-based extraction for phones, emails, social links, addresses
 - Handles ~90% of sites successfully
@@ -75,18 +75,17 @@ Each domain is processed through three tiers with automatic fallback based on qu
 
 ### Quality Scoring
 
-Every scrape result is scored 0-100 based on:
-- Has phone number? (+20 with tel: link, +15 with regex)
-- Has email? (+15)
-- Has social media? (+10)
-- Has description? (+10)
-- Has address? (+10)
-- Has multiple data sources? (+5-15 bonus)
-- Only results below 70 get promoted to the next tier
+Every scrape result starts at 100 and loses points for data quality problems:
+- Missing company name? (-15)
+- No emails? (-10) | No phones? (-10) | No addresses? (-10)
+- No description? (-5)
+- Placeholder/junk/garbled emails? (-10 to -20 each)
+- Garbage addresses, URL-as-name, spam content? (-10 to -30)
+- Only results scoring below 70 get promoted to the next tier
 
 ### Ethical Scraping
 - **robots.txt compliance**: Every domain's robots.txt is fetched, parsed, and cached. Disallowed paths are skipped.
-- **Transparent User-Agent**: Identifies as `VeridionChallengeCrawler/1.0` — never spoofs a browser
+- **Standard User-Agent**: Uses a Chrome User-Agent string for maximum compatibility with web servers
 - **Minimal footprint**: Max 3 pages per domain. No deep crawling, sitemaps, or recursive discovery
 - **Public data only**: Extracts phone numbers, social media, addresses from public company pages
 - **Respects bot detection**: Gracefully handles Cloudflare, reCAPTCHA — does not attempt bypass
@@ -166,7 +165,7 @@ Every extracted data point passes through dedicated normalizers before storage. 
 
 ### URL Normalizer
 - Strips double protocols (`https://https//`), www prefixes, paths, query parameters
-- **Domain blacklist**: google.com, bing.com, facebook.com, youtube.com, twitter.com (present as noise in test data)
+- **Domain blacklist**: google.com, bing.com, facebook.com, youtube.com, twitter.com, instagram.com (present as noise in test data)
 - **26 unit tests** including all malformed URLs from challenge data
 
 ### Facebook Normalizer

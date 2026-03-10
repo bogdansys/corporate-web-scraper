@@ -9,12 +9,11 @@ A full-stack solution for scraping, normalizing, indexing, and matching company 
 ```bash
 npm install                    # Install dependencies
 docker compose up -d           # Start ElasticSearch
-npm run scrape                 # Scrape 997 websites (3-tier: HTTP → Browser → AI)
-npm run pipeline               # Merge + normalize + seed Supabase + index ES
 npm run api                    # Start API → http://localhost:3000
-npm run test:match-rate        # Test all 32 inputs
 cd dashboard && npm install && npm run dev  # Dashboard → http://localhost:5173
 ```
+
+All other operations (scraping, pipeline, matching) can be run from the dashboard's **Command Center**.
 
 ## Architecture
 

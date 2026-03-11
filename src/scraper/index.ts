@@ -5,16 +5,18 @@ import { load } from 'cheerio';
 import pLimit from 'p-limit';
 import { fetchPage } from './fetcher.js';
 import { fetchPageWithBrowser, launchBrowser, closeBrowser } from './browser-fetcher.js';
+import { fetchWithPinchTab, launchPinchTabPool, closePinchTabPool } from './pinchtab-fetcher.js';
 import { getRobotsRules, isPathAllowed } from './robots.js';
 import { extractPhones } from './extractors/phone.js';
 import { extractSocialLinks, getSocialPlatform } from './extractors/social.js';
 import { extractAddresses } from './extractors/address.js';
 import { extractMeta } from './extractors/meta.js';
+import { htmlToText } from './html-to-text.js';
 import { config } from '../shared/config.js';
 import { logger } from '../shared/logger.js';
 import type { ScrapeResult } from '../shared/types.js';
 import { scoreResult } from './quality-scorer.js';
-import { extractWithGemini, isGeminiConfigured } from './gemini-extractor.js';
+import { extractWithGemini, extractWithGeminiFromText, isGeminiConfigured } from './gemini-extractor.js';
 import { mergeGeminiResult } from './tier3-merger.js';
 
 // Subpages ordered by contact-data yield: contact pages first, then about, then team
@@ -412,6 +414,55 @@ async function scrapeDomainBrowser(domain: string): Promise<{ result: ScrapeResu
 }
 
 /**
+ * Tier 2 (PinchTab): Fetch page text using PinchTab multi-instance browser.
+ * Captures clean text for Tier 3. No HTML extraction (PinchTab doesn't expose raw HTML).
+ * Domains scraped here go directly to Tier 3 for data extraction.
+ */
+async function scrapeDomainPinchTab(domain: string): Promise<{ result: ScrapeResult; text: string }> {
+  const start = Date.now();
+  const result: ScrapeResult = {
+    domain,
+    company_name: null,
+    success: false,
+    phone_numbers: [],
+    social_links: {},
+    addresses: [],
+    emails: [],
+    short_description: null,
+    technologies: [],
+    logo_url: null,
+    industry_keywords: [],
+    year_founded: null,
+    crawl_time_ms: 0,
+    pages_crawled: [],
+  };
+
+  const url = `https://${domain}`;
+  let res = await fetchWithPinchTab(url);
+
+  if (!res.text) {
+    // Try www variant
+    const wwwUrl = `https://www.${domain}`;
+    res = await fetchWithPinchTab(wwwUrl);
+  }
+
+  if (!res.text) {
+    result.error = `PinchTab Tier 2 failed: ${res.error || 'No content'}`;
+    result.crawl_time_ms = Date.now() - start;
+    return { result, text: '' };
+  }
+
+  result.success = true;
+  result.pages_crawled.push(res.url);
+  if (res.title) {
+    result.company_name = res.title;
+  }
+
+  result.crawl_time_ms = Date.now() - start;
+  return { result, text: res.text };
+}
+
+/**
  * Main scraper: read domains from CSV and scrape them concurrently.
  */
 async function main() {
@@ -429,6 +480,7 @@ async function main() {
   }
   const useTier2 = args.includes('--tier2');
   const useTier3 = args.includes('--tier3');
+  const usePinchTab = args.includes('--pinchtab');
 
   // Read domains from CSV
   const csvPath = 'SampleData/sample-websites.csv';
@@ -514,7 +566,9 @@ async function main() {
 
   // ── Tier 2: Headless browser fallback ──────────────────
   let tier2Recovered = 0;
-  if (useTier2 && !killed) {
+  const textStore = new Map<string, string>(); // domain → clean text for Tier 3
+
+  if ((useTier2 || usePinchTab) && !killed) {
     // Find failed domains that are worth retrying
     // Skip: DNS dead, 404s, TLS/SSL errors, connection refused — browser won't fix these
     const retriable = results.filter(
@@ -527,66 +581,106 @@ async function main() {
     );
 
     if (retriable.length > 0) {
+      const engine = usePinchTab ? 'PINCHTAB' : 'PLAYWRIGHT';
+      const concurrency = usePinchTab ? config.pinchtab.concurrency : 3;
+
       console.log('');
       console.log('╔══════════════════════════════════════════════════════╗');
-      console.log('║         TIER 2 — HEADLESS BROWSER FALLBACK          ║');
+      console.log(`║     TIER 2 — ${engine.padEnd(10)} BROWSER FALLBACK          ║`);
       console.log('╠══════════════════════════════════════════════════════╣');
       console.log(`║  Retrying              │ ${retriable.length.toString().padStart(6)} domains           ║`);
-      console.log(`║  Concurrency           │      3                  ║`);
+      console.log(`║  Concurrency           │ ${concurrency.toString().padStart(6)}                  ║`);
       console.log('╚══════════════════════════════════════════════════════╝');
       console.log('');
 
-      await launchBrowser();
-      const tier2Limiter = pLimit(3);
+      if (usePinchTab) {
+        await launchPinchTabPool();
+      } else {
+        await launchBrowser();
+      }
+      const tier2Limiter = pLimit(concurrency);
       let tier2Done = 0;
 
       const tier2Promises = retriable.map((failedResult) =>
         tier2Limiter(async () => {
           if (killed) return;
           const BROWSER_DEADLINE = 20_000;
-          const t2 = await Promise.race([
-            scrapeDomainBrowser(failedResult.domain),
-            new Promise<{ result: ScrapeResult; html: string }>((resolve) =>
-              setTimeout(() => resolve({
-                result: {
-                  domain: failedResult.domain, company_name: null, success: false,
-                  phone_numbers: [], social_links: {}, addresses: [], emails: [],
-                  short_description: null, technologies: [], logo_url: null,
-                  industry_keywords: [], year_founded: null,
-                  crawl_time_ms: BROWSER_DEADLINE, pages_crawled: [],
-                  error: 'Tier 2 deadline exceeded (20s)',
-                },
-                html: '',
-              }), BROWSER_DEADLINE),
-            ),
-          ]);
-          const t2Result = t2.result;
 
-          tier2Done++;
-          if (t2Result.success) {
-            tier2Recovered++;
-            if (t2.html) htmlStore.set(failedResult.domain, t2.html);
-            // Replace the failed result with the successful Tier 2 result
-            const idx = results.indexOf(failedResult);
-            if (idx !== -1) results[idx] = t2Result;
+          if (usePinchTab) {
+            // PinchTab path: get text (no HTML), store for Tier 3
+            const t2 = await Promise.race([
+              scrapeDomainPinchTab(failedResult.domain),
+              new Promise<{ result: ScrapeResult; text: string }>((resolve) =>
+                setTimeout(() => resolve({
+                  result: {
+                    domain: failedResult.domain, company_name: null, success: false,
+                    phone_numbers: [], social_links: {}, addresses: [], emails: [],
+                    short_description: null, technologies: [], logo_url: null,
+                    industry_keywords: [], year_founded: null,
+                    crawl_time_ms: BROWSER_DEADLINE, pages_crawled: [],
+                    error: 'PinchTab Tier 2 deadline exceeded (20s)',
+                  },
+                  text: '',
+                }), BROWSER_DEADLINE),
+              ),
+            ]);
+
+            tier2Done++;
+            if (t2.result.success) {
+              tier2Recovered++;
+              if (t2.text) textStore.set(failedResult.domain, t2.text);
+              const idx = results.indexOf(failedResult);
+              if (idx !== -1) results[idx] = t2.result;
+            }
+          } else {
+            // Playwright path: get HTML, extract data
+            const t2 = await Promise.race([
+              scrapeDomainBrowser(failedResult.domain),
+              new Promise<{ result: ScrapeResult; html: string }>((resolve) =>
+                setTimeout(() => resolve({
+                  result: {
+                    domain: failedResult.domain, company_name: null, success: false,
+                    phone_numbers: [], social_links: {}, addresses: [], emails: [],
+                    short_description: null, technologies: [], logo_url: null,
+                    industry_keywords: [], year_founded: null,
+                    crawl_time_ms: BROWSER_DEADLINE, pages_crawled: [],
+                    error: 'Tier 2 deadline exceeded (20s)',
+                  },
+                  html: '',
+                }), BROWSER_DEADLINE),
+              ),
+            ]);
+
+            tier2Done++;
+            if (t2.result.success) {
+              tier2Recovered++;
+              if (t2.html) htmlStore.set(failedResult.domain, t2.html);
+              const idx = results.indexOf(failedResult);
+              if (idx !== -1) results[idx] = t2.result;
+            }
           }
 
           const bar = '█'.repeat(Math.floor((tier2Done / retriable.length) * 30)) +
                       '░'.repeat(30 - Math.floor((tier2Done / retriable.length) * 30));
           process.stdout.write(
-            `\r[${bar}] ${tier2Done}/${retriable.length} | recovered ${tier2Recovered} | ${failedResult.domain.slice(0, 30).padEnd(30)} ${t2Result.success ? '✓' : '✗'}   `,
+            `\r[${bar}] ${tier2Done}/${retriable.length} | recovered ${tier2Recovered} | ${failedResult.domain.slice(0, 30).padEnd(30)}   `,
           );
           if (tier2Done === retriable.length) process.stdout.write('\n');
         }),
       );
 
       await Promise.all(tier2Promises);
-      await closeBrowser();
+
+      if (usePinchTab) {
+        await closePinchTabPool();
+      } else {
+        await closeBrowser();
+      }
 
       if (tier2Recovered > 0) {
-        logger.info(`Tier 2 recovered ${tier2Recovered}/${retriable.length} domains`);
+        logger.info(`Tier 2 (${engine}) recovered ${tier2Recovered}/${retriable.length} domains`);
       } else {
-        logger.info('Tier 2 recovered 0 additional domains');
+        logger.info(`Tier 2 (${engine}) recovered 0 additional domains`);
       }
     }
   }
@@ -594,21 +688,34 @@ async function main() {
   // ── Tier 3: Gemini AI data refinement ──────────────────
   let tier3Improved = 0;
   let tier3CandidateCount = 0;
+  let tier3TextMode = 0; // Count how many used text-based (token-efficient) prompt
+  let tier3HtmlMode = 0; // Count how many used HTML-based (legacy) prompt
   if (useTier3 && !killed) {
     if (!isGeminiConfigured()) {
       console.log('\n⚠ Tier 3 requested but GEMINI_API_KEY is not set. Skipping AI refinement.\n');
     } else {
+      // Convert HTML to text for all domains in htmlStore (token reduction)
+      for (const [domain, html] of htmlStore) {
+        if (!textStore.has(domain)) {
+          textStore.set(domain, htmlToText(html));
+        }
+      }
+
       // Score all successful results and find candidates
-      const successWithHtml = results.filter((r) => r.success && htmlStore.has(r.domain));
-      const allScored = successWithHtml.map((r) => ({ result: r, quality: scoreResult(r) }));
+      // Candidates need either text or html available
+      const successWithData = results.filter(
+        (r) => r.success && (textStore.has(r.domain) || htmlStore.has(r.domain)),
+      );
+      const allScored = successWithData.map((r) => ({ result: r, quality: scoreResult(r) }));
 
       // Show scoring overview
       const successTotal = results.filter((r) => r.success).length;
-      const withHtml = successWithHtml.length;
+      const withData = successWithData.length;
+      const withText = [...textStore.keys()].filter((d) => results.some((r) => r.success && r.domain === d)).length;
       const belowThreshold = allScored.filter(({ quality }) => quality.needsTier3).length;
 
       console.log('');
-      console.log(`ℹ Tier 3 scoring: ${successTotal} successful, ${withHtml} have HTML stored, ${belowThreshold} below quality threshold (${config.gemini.qualityThreshold})`);
+      console.log(`ℹ Tier 3 scoring: ${successTotal} successful, ${withData} have data stored (${withText} text, ${htmlStore.size} html), ${belowThreshold} below quality threshold (${config.gemini.qualityThreshold})`);
 
       // Log all scores for debugging
       for (const { result: r, quality } of allScored.sort((a, b) => a.quality.score - b.quality.score)) {
@@ -643,19 +750,34 @@ async function main() {
         const tier3Promises = candidates.map(({ result: candidateResult, quality }) =>
           tier3Limiter(async () => {
             if (killed) return;
+
+            // Prefer text-based extraction (token-efficient) over HTML
+            const text = textStore.get(candidateResult.domain);
             const html = htmlStore.get(candidateResult.domain);
-            if (!html) return;
+            if (!text && !html) return;
 
             try {
-              const geminiResult = await extractWithGemini(
-                candidateResult.domain,
-                html,
-                candidateResult,
-              );
+              let geminiResult;
+              if (text) {
+                // Token-efficient path: ~1-2K tokens instead of ~15-20K
+                geminiResult = await extractWithGeminiFromText(
+                  candidateResult.domain,
+                  text,
+                  candidateResult,
+                );
+                tier3TextMode++;
+              } else {
+                // Legacy path: full HTML
+                geminiResult = await extractWithGemini(
+                  candidateResult.domain,
+                  html!,
+                  candidateResult,
+                );
+                tier3HtmlMode++;
+              }
 
               if (geminiResult) {
                 const merged = mergeGeminiResult(candidateResult, geminiResult, candidateResult.domain);
-                // Replace in results array
                 const idx = results.indexOf(candidateResult);
                 if (idx !== -1) {
                   results[idx] = merged;
@@ -690,8 +812,9 @@ async function main() {
         logger.info('Tier 3: all results scored above quality threshold — no refinement needed');
       }
     }
-    // Free HTML memory
+    // Free memory
     htmlStore.clear();
+    textStore.clear();
   }
 
   const totalTimeMs = Date.now() - overallStart;
@@ -735,9 +858,10 @@ async function main() {
   console.log(`║    Total time           ${rpad((totalTimeMs / 1000).toFixed(1) + 's', 7)}                             ║`);
   console.log(`║    Avg per domain       ${rpad((totalTimeMs / domains.length).toFixed(0) + 'ms', 7)}                             ║`);
   console.log(`║    Avg per success      ${rpad(avgCrawlMs.toFixed(0) + 'ms', 7)}                             ║`);
-  if (useTier2) {
+  if (useTier2 || usePinchTab) {
+    const engine = usePinchTab ? 'PINCHTAB' : 'PLAYWRIGHT';
     console.log('║                                                              ║');
-    console.log('║  TIER 2 BROWSER FALLBACK                                    ║');
+    console.log(`║  TIER 2 BROWSER FALLBACK (${engine.padEnd(10)})                     ║`);
     const retriableCount = results.filter(
       (r) => !r.success && !r.error?.includes('DNS resolution failed') && !r.error?.includes('HTTP 404'),
     ).length + tier2Recovered; // add back recovered since they're now successful
@@ -749,6 +873,10 @@ async function main() {
     console.log('║  TIER 3 AI REFINEMENT                                       ║');
     console.log(`║    Candidates scored    ${rpad(String(tier3CandidateCount), 6)}                              ║`);
     console.log(`║    Improved             ${rpad(String(tier3Improved), 6)}                              ║`);
+    if (tier3TextMode > 0 || tier3HtmlMode > 0) {
+      console.log(`║    Text mode (efficient)${rpad(String(tier3TextMode), 6)}                              ║`);
+      console.log(`║    HTML mode (legacy)   ${rpad(String(tier3HtmlMode), 6)}                              ║`);
+    }
   }
   console.log('║                                                              ║');
   console.log('║  FAILURE BREAKDOWN                                          ║');

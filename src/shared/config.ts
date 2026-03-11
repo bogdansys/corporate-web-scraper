@@ -30,4 +30,8 @@ export const config = {
     concurrency: parseInt(process.env.GEMINI_CONCURRENCY || '5', 10),
     qualityThreshold: parseInt(process.env.GEMINI_QUALITY_THRESHOLD || '70', 10),
   },
+  pinchtab: {
+    url: process.env.PINCHTAB_URL || 'http://localhost:9867',
+    concurrency: parseInt(process.env.PINCHTAB_CONCURRENCY || '8', 10),
+  },
 };

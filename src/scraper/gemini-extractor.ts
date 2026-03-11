@@ -90,6 +90,61 @@ PAGE CONTENT:
 ${truncated}`;
 }
 
+/**
+ * Build a token-efficient prompt using clean text instead of raw HTML.
+ * ~1-2K tokens input vs ~15-20K tokens with HTML.
+ */
+function buildPromptFromText(domain: string, text: string, existing: ScrapeResult): string {
+  // Text is already clean and truncated (~4000 chars max from htmlToText)
+  const existingData = {
+    company_name: existing.company_name,
+    emails: existing.emails.map((e) => e.value),
+    phones: existing.phone_numbers.map((p) => p.value),
+    addresses: existing.addresses.map((a) => a.value),
+    year_founded: existing.year_founded,
+    description: existing.short_description?.value || null,
+  };
+
+  return `You are a business data extraction specialist. Extract structured business information from this webpage text.
+
+DOMAIN: ${domain}
+
+EXISTING DATA (regex-extracted — may contain errors, validate and correct):
+${JSON.stringify(existingData, null, 2)}
+
+CRITICAL RULES:
+- Emails: Only include real business contact emails for this company. REJECT placeholder emails (your@email.com, info@example.com), emails from third-party services. If an email domain does not match the business, verify it appears as a legitimate contact.
+- Phone numbers: Only include actual business contact phone numbers. Return phones in E.164 format (e.g., +15551234567).
+- Addresses: Extract clean, properly formatted physical addresses. Deduplicate — return each unique address once.
+- Year founded: Extract the year the company was FOUNDED or ESTABLISHED. The copyright year is NOT the founding year unless explicitly stated. If unsure, return null.
+- Company name: Extract the actual business name. REJECT URLs or overly long text.
+- Description: A concise 1-2 sentence description of what this company does.
+- Logo URL: Must be absolute URL starting with http. If only relative, prepend "https://${domain}".
+- Social links: Only extract social media URLs belonging to THIS company.
+
+Return this exact JSON structure:
+{
+  "company_name": "string or null",
+  "emails": ["array of valid email strings"],
+  "phone_numbers": ["array of E.164 phone strings"],
+  "addresses": ["array of clean address strings"],
+  "short_description": "string or null",
+  "year_founded": "number or null",
+  "logo_url": "absolute URL string or null",
+  "social_links": {
+    "facebook": "URL or null",
+    "twitter": "URL or null",
+    "linkedin": "URL or null",
+    "instagram": "URL or null",
+    "youtube": "URL or null"
+  },
+  "confidence_notes": "brief note about data quality"
+}
+
+PAGE TEXT:
+${text}`;
+}
+
 const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 2000;
 
@@ -176,6 +231,86 @@ export async function extractWithGemini(
       }
 
       // Non-retryable error or exhausted retries
+      return null;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Extract structured business data from CLEAN TEXT using Gemini Flash.
+ * Token-efficient: ~1-2K tokens input instead of ~15-20K with HTML.
+ * Returns null on failure.
+ */
+export async function extractWithGeminiFromText(
+  domain: string,
+  text: string,
+  existingResult: ScrapeResult,
+): Promise<GeminiExtractionResult | null> {
+  if (consecutive429s >= CIRCUIT_BREAKER_LIMIT) {
+    return null;
+  }
+
+  const client = getClient();
+  const model = client.getGenerativeModel({
+    model: config.gemini.model,
+    generationConfig: {
+      responseMimeType: 'application/json',
+      temperature: 0.1,
+    },
+  });
+
+  const prompt = buildPromptFromText(domain, text, existingResult);
+
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const result = await Promise.race([
+        model.generateContent(prompt),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('Gemini timeout (30s)')), 30_000),
+        ),
+      ]);
+
+      const responseText = result.response.text();
+      const jsonStr = responseText
+        .replace(/^```json\s*/i, '')
+        .replace(/^```\s*/i, '')
+        .replace(/\s*```$/i, '')
+        .trim();
+
+      const parsed = JSON.parse(jsonStr) as GeminiExtractionResult;
+      consecutive429s = 0;
+
+      return {
+        company_name: parsed.company_name ?? null,
+        emails: Array.isArray(parsed.emails) ? parsed.emails.filter((e) => typeof e === 'string') : [],
+        phone_numbers: Array.isArray(parsed.phone_numbers) ? parsed.phone_numbers.filter((p) => typeof p === 'string') : [],
+        addresses: Array.isArray(parsed.addresses) ? parsed.addresses.filter((a) => typeof a === 'string') : [],
+        short_description: parsed.short_description ?? null,
+        year_founded: typeof parsed.year_founded === 'number' ? parsed.year_founded : null,
+        logo_url: typeof parsed.logo_url === 'string' ? parsed.logo_url : null,
+        social_links: parsed.social_links && typeof parsed.social_links === 'object' ? parsed.social_links : {},
+        confidence_notes: typeof parsed.confidence_notes === 'string' ? parsed.confidence_notes : '',
+      };
+    } catch (err: unknown) {
+      const status = (err as { status?: number })?.status;
+      const isRetryable = status === 429 || (status !== undefined && status >= 500);
+
+      if (status === 429) {
+        consecutive429s++;
+        if (consecutive429s >= CIRCUIT_BREAKER_LIMIT) {
+          console.warn(`\n⚠ Gemini rate limit circuit breaker tripped after ${CIRCUIT_BREAKER_LIMIT} consecutive 429s. Skipping remaining Tier 3.`);
+          return null;
+        }
+      }
+
+      if (attempt < MAX_RETRIES && isRetryable) {
+        const delay = BASE_DELAY_MS * Math.pow(2, attempt);
+        await new Promise((r) => setTimeout(r, delay));
+        continue;
+      }
+
       return null;
     }
   }
